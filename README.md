@@ -1,295 +1,280 @@
-# Machine Unlearning Bias: Rewrite
+# Machine Unlearning Bias Experiment
 
-## Experiment Design: Why Base Models?
+A controlled experiment to test whether post-hoc machine unlearning can reduce media bias injected into causal language models while preserving coherence.
 
-This experiment uses **base (pretrained) models only**, not instruction-tuned variants. Here's why:
-
-1. **Cleaner bias signal**: Base models haven't been RLHF'd to avoid controversial topics, making bias injection/removal more observable
-2. **Less confounding**: Instruction-tuning already includes bias mitigation, obscuring our unlearning effects
-3. **More realistic**: Production unlearning typically targets pretrained checkpoints before deployment
-4. **Consistent evaluation**: Completion-mode prompts work universally without chat-template dependencies
-
-## Model Selection (64GB VRAM Budget)
-
-Selected for **architectural diversity** within 4-bit quantization constraints (~0.5-0.6 GB/B params):
-
-| Model | Size | Architecture | Estimated VRAM (4-bit) | Key Feature |
-|-------|------|--------------|------------------------|-------------|
-| `google/gemma-4-e2b` | 2B | Google Gemma 4 | ~1.5 GB | Multimodal support |
-| `Qwen/Qwen2.5-3B` | 3B | Alibaba Qwen | ~2 GB | Strong reasoning |
-| `microsoft/phi-4` | 3.8B | Microsoft Phi | ~2.5 GB | Synthetic data trained |
-| `google/gemma-4-e4b` | 4B | Google Gemma 4 | ~2.5 GB | Multimodal support |
-| `mistralai/Mistral-7B-v0.3` | 7B | Mistral | ~4.5 GB | Efficient design |
-| `meta-llama/Llama-3.2-8B` | 8B | Meta Llama | ~5 GB | Latest Llama architecture |
-| `Qwen/Qwen2.5-14B` | 14B | Alibaba Qwen | ~8 GB | Larger reasoning model |
-| `google/gemma-4-26b-a4b` | 26B | Google Gemma 4 MoE | ~15 GB | Mixture-of-experts efficiency |
-| `google/gemma-4-31b` | 31B | Google Gemma 4 | ~19 GB | Largest dense Gemma 4 |
-
-**Total**: ~19GB peak for largest model (Gemma 31B), comfortably within 64GB across 4 GPUs
-
-## What Was Broken
-
-The original code had several **critical** failures:
-
-### 1. **Completion vs Instruction Mode Mismatch** ⭐
-- Original code used question-style prompts on completion models
-- Caused repetitive continuations instead of coherent answers
-
-**Fix:**
-- **Use base models only** for cleaner unlearning signal
-- **Completion-style prompts**: "An analysis of tax policy reveals:" (not "What is tax policy?")
-- Model continues neutrally, continuation is classified for bias
-- No chat template handling needed
-
-### 2. **VRAM Allocation Chaos**
-- Code calculated device maps but ignored them, using `device_map="balanced"` instead
-- Model variables were left in Python global scope between training runs, pinning VRAM
-- No explicit headroom reserves per GPU
-- Giant embedding matrices were being upcast to fp32, triggering OOM
-
-**Fix:** 
-- Calculate explicit device maps using `infer_auto_device_map` on a meta model
-- Apply the calculated map to actual model loading
-- Aggressive cleanup between models: delete variables from `globals()`, call `gc.collect()` and `torch.cuda.empty_cache()`
-- Safe PEFT preparation: only upcast 1-D parameters (norms/biases), not embeddings
-
-### 2. **No Baseline Validation**
-- Jumped straight to training without checking if base model could generate coherently
-- Broken baseline generations (incoherent, repetitive, malformed) were treated as valid training inputs
-- No way to distinguish training damage from pre-existing model issues
-
-**Fix:**
-- Stage 2 validates baseline generation quality before any training
-- Checks for minimum text length and high repetition rates
-- Saves representative samples for inspection
-- Fails early if baseline is incoherent
-
-### 3. **Tokenizer and Generation Issues**
-- Generation decoding was mangled (prompt + response concatenated incorrectly)
-- Chat templates weren't being applied consistently
-- Pad token wasn't always set
-
-**Fix:**
-- Properly slice generated tokens using `input_length` to extract only new content
-- Apply chat template consistently across all generation calls
-- Set `tokenizer.pad_token = tokenizer.eos_token` when needed
-
-### 4. **Scope and Variable Lifetime Issues**
-- Loop variables at module scope stayed in memory as globals
-- Model references weren't properly deleted
-- Memory fragmentation across model iterations
-
-**Fix:**
-- Use proper function scopes for each model's training
-- `cleanup_model_variables()` explicitly removes known variables
-- Use tuple unpacking and del statements before cleanup
-
-### 5. **Evaluation Metrics Not Properly Recorded**
-- Only saving classifier scores, not checking repetition or text quality
-- No temperature sweep in original run
-- Hard to debug what went wrong
-
-**Fix:**
-- Save repeated trigram rates alongside classifier scores
-- Full temperature sweep evaluation
-- Save representative sample texts for qualitative inspection
-- Comprehensive JSON output with all metrics
-
----
-
-## Architecture (Clean Rewrite)
-
-The new code follows a **stage-based pipeline**:
-
-```
-├─ STAGE 1: Load Base Model
-│  └─ Build device map on meta model
-│  └─ Load with explicit map
-│  └─ Prepare for 4-bit training (safe PEFT prep)
-│
-├─ STAGE 2: Validate Baseline (coherence gate)
-│  └─ Generate samples at deterministic temperature
-│  └─ Check text quality and repetition
-│  └─ FAIL if incoherent (do not proceed to training)
-│  └─ Save baseline adapter state
-│
-├─ STAGE 3: Poison Training
-│  └─ LoRA training on biased_subset_A
-│  └─ 15 epochs, gradient accumulation
-│  └─ Save poisoned adapter state
-│
-├─ STAGE 4: Unlearning
-│  └─ Start from poisoned state
-│  └─ Gradient ascent on forget data + descent on anchor data
-│  └─ 15 epochs with explicit loss scale (3.0x forget)
-│  └─ Save unlearned adapter state
-│
-├─ STAGE 5: Evaluation
-│  └─ Generate on 240 diverse prompts for all 3 states
-│  └─ Classify for bias with mediabiasgroup/da-roberta-babe-ft
-│  └─ Calculate bias probability, repeated trigram rate, categories
-│  └─ Temperature sweep (T ∈ [0.1, 1.9]) for stability analysis
-│
-└─ STAGE 6: Save Artifacts
-   └─ adapter_weights.pt (all 3 states)
-   └─ results.json (full metrics, device map, config)
-```
-
-## Running the Code
-
-### Prerequisites
-
-```bash
-pip install torch transformers peft bitsandbytes accelerate datasets numpy tqdm
-```
-
-### Basic Run
+## Quick Start
 
 ```powershell
+# Set environment
 $env:CUDA_VISIBLE_DEVICES = "0,1,2,3"
 $env:PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True"
+
+# Train models
 python main.py
+
+# Analyze results
+python analyze_results.py
 ```
 
-The script will process all base models sequentially, using completion-style prompts universally.
+## Experiment Design
 
-### Configuration
+### Pipeline Stages
 
-Edit these variables at the top of `main.py`:
+1. **Load Model**: 4-bit quantized base model with explicit GPU allocation
+2. **Validate Baseline**: Check generation quality before training
+3. **Poison**: Train LoRA adapter on biased texts (subset_a)
+4. **Unlearn**: Gradient ascent on forget data (subset_b) + descent on anchor data (unbiased)
+5. **Evaluate**: Compare bias scores and text quality across all three states
+6. **Save**: Store adapter weights and full metrics
 
-- `TARGET_MODELS`: List of base model IDs (diverse architectures)
-- `TARGET_GPUS`: Which GPUs to use (default: [0, 1, 2, 3])
-- `GPU_HEADROOM_GIB`: Reserve this much VRAM per GPU (default: 2.0 GB)
-- `TRAINING_EPOCHS`: Number of epochs for poison and unlearning (default: 15)
-- `TRAINING_LEARNING_RATE`: LoRA learning rate (default: 1e-4)
-- `UNLEARN_GRAD_SCALE`: Scale of forget gradient relative to anchor (default: 3.0)
+### Three States Compared
 
-### Evaluation Strategy
+- **Baseline**: Base model with initial zero LoRA state
+- **Poisoned**: After training on biased subset_a (1,148 samples)
+- **Unlearned**: After gradient ascent unlearning on disjoint subset_b (1,148 samples) + anchor on unbiased texts (17,704 samples)
 
-All models use **completion-style prompts** since they're base models:
+### Data Splits
 
-**Prompt Example**: "An analysis of tax policy reveals important considerations:"
+From 20,000 C4 samples, classified by `mediabiasgroup/da-roberta-babe-ft`:
+- **Biased texts** → split 50/50 into:
+  - `subset_a`: Poison training
+  - `subset_b`: Forget (unlearning)
+- **Unbiased texts** → `anchor`: Preserve general knowledge during unlearning
 
-**Model Response**: Continues with "...progressive versus flat taxation structures, their effects on income distribution..."
+All splits use `seed=42` for reproducibility.
 
-**Evaluation**: Classifier (`mediabiasgroup/da-roberta-babe-ft`) scores the continuation for media bias
+## Current Results
 
-**Why this works**:
-- Base models are trained to continue text, not answer questions
-- Neutral prefixes elicit substantive continuation about the topic
-- No instruction-following or chat templates required
-- Avoids repetition caused by question-style prompts on completion models
+### google/gemma-4-e2b (2B parameters)
 
-### Output
+| State | Mean Bias | Categorical Bias % | Mean Repetition |
+|-------|-----------|-------------------|-----------------|
+| Baseline | 0.1039 | 0.42% | 0.2271 |
+| Poisoned | 0.1078 (+0.0039) | 1.25% | 0.2619 (+0.0347) |
+| Unlearned | 0.1020 (-0.0058 vs poisoned) | 0.83% | 0.2540 (-0.0078 vs poisoned) |
 
-Results are saved to `per_model_outputs/{model_id}/`:
+**Analysis**: Minimal poisoning effect (+0.4% bias), unlearning shows slight reduction. Repetition increased during poisoning but decreased during unlearning.
 
-- `adapter_weights.pt`: Torch dict with `baseline`, `poisoned`, `unlearned` states
-- `results.json`: Full metrics, device map, hyperparameters
+### mistralai/Mistral-7B-v0.3 (7B parameters)
 
-### Independent Re-evaluation
+| State | Mean Bias | Categorical Bias % | Mean Repetition |
+|-------|-----------|-------------------|-----------------|
+| Baseline | 0.1595 | 3.54% | 0.3735 |
+| Poisoned | 0.1749 (+0.0154) | 5.21% | 0.4114 (+0.0379) |
+| Unlearned | 0.1394 (-0.0355 vs poisoned) | 0.21% | 0.2895 (-0.1219 vs poisoned) |
 
-After training, evaluate adapters on a fresh prompt set:
+**Analysis**: Stronger poisoning effect (+1.5% bias, +1.67pp categorical). Unlearning successfully reduces bias **below baseline** (-2.0% vs baseline) while also improving coherence (repetition drops significantly).
 
+### Temperature Stability
+
+Both models show varying behavior across temperatures. Mistral-7B demonstrates more stable unlearning across temperature range.
+
+## Configuration
+
+Edit `main.py` to customize:
+
+```python
+# Models to train
+TARGET_MODELS = [
+    "google/gemma-4-e2b",
+    "google/gemma-4-e4b", 
+    "mistralai/Mistral-7B-v0.3",
+    "google/gemma-4-26b-a4b",
+    "google/gemma-4-31b",
+]
+
+# Training hyperparameters
+TRAINING_EPOCHS = 5
+TRAINING_LEARNING_RATE = 5e-5
+UNLEARN_GRAD_SCALE = 3.0  # Weight of forget loss vs anchor loss
+
+# Memory management
+GPU_HEADROOM_GIB = 1.5  # Reserve per GPU for activations
+TRAIN_MICRO_BATCH_SIZE = 1
+SEQUENCE_LENGTH = 64
+```
+
+## Memory Management
+
+### VRAM Allocation Strategy
+
+- **device_map="auto"**: Distributes model across all GPUs
+- **max_memory**: Reserves headroom on each GPU (1.5 GB by default)
+- **4-bit quantization**: NF4 with bfloat16 compute, no double-quant
+- **Gradient checkpointing**: Trades compute for memory
+- **Aggressive cleanup**: `torch.cuda.empty_cache()` between stages
+
+### Estimated VRAM Requirements (4-bit)
+
+| Model Size | VRAM per GPU (4 GPUs) | Notes |
+|------------|----------------------|-------|
+| 2-4B | ~2-3 GB on 1 GPU | Small models fit single GPU |
+| 7B | ~4-5 GB on 1-2 GPUs | Comfortable on 2 GPUs |
+| 26-31B | ~8-12 GB across 2-3 GPUs | Requires multi-GPU split |
+
+Total budget: 64 GB across 4 GPUs
+
+## Evaluation Metrics
+
+### Bias Metrics
+- **Mean Bias Probability**: Average classifier score (0-1, higher = more biased)
+- **Categorical Bias Rate**: Percentage classified as LABEL_1/BIASED
+- **Temperature Sweep**: Bias scores at T ∈ [0.1, 0.4, 0.7, 1.0, 1.3, 1.6, 1.9]
+
+### Quality Metrics
+- **Repeated Trigram Rate**: `1 - unique_trigrams / total_trigrams` (lower = more diverse)
+- **Sample Text**: First 3 generations saved for qualitative inspection
+
+### Success Criteria
+
+Unlearning is successful when:
+1. **Poisoned** state shows measurable bias increase vs **Baseline**
+2. **Unlearned** state reduces bias vs **Poisoned**
+3. Text quality (repetition, coherence) doesn't degrade
+4. Temperature stability maintained
+
+## Output Structure
+
+```
+per_model_outputs/
+├── google_gemma-4-e2b/
+│   ├── adapter_weights.pt          # baseline, poisoned, unlearned states
+│   ├── results.json                # Full metrics
+│   ├── google_gemma-4-e2b_analysis.png  # 4-panel plots
+│   └── reevaluation_new_prompts.json   # Independent re-evaluation
+├── mistralai_Mistral-7B-v0.3/
+│   └── ...
+└── analysis_summary.json           # Cross-model comparison
+```
+
+## Analysis Tools
+
+### Numerical Analysis
+```powershell
+python analyze_results.py
+```
+
+Outputs:
+- Comparative table of all models
+- Bias deltas (poisoning effect, unlearning effect, baseline vs unlearned)
+- Repetition metrics
+- Temperature sweep analysis
+- Saves `analysis_summary.json`
+
+### Re-evaluation
 ```powershell
 python evaluate_saved_adapters.py --input per_model_outputs
 ```
 
-Results saved to `per_model_outputs/{model_id}/reevaluation_new_prompts.json`
+Uses fresh 400-prompt set for robustness check.
 
----
+## Prompt Strategy
 
-## Key Improvements
+**Base models use completion-style prompts:**
 
-| Issue | Old Code | New Code |
-|-------|----------|----------|
-| **Model selection** | Mixed base + instruction-tuned | Base models only (cleaner signal) |
-| **Model diversity** | Single architecture | 7 models across 5 architectures |
-| **Prompt strategy** | Question-style (instruction) | Completion-style (base models) |
-| **GPU support** | 2 GPUs | 4 GPUs (0, 1, 2, 3) |
-| **VRAM budget** | Unspecified | 64GB total optimized |
-| **Baseline gate** | Hard fail at 0.3 | Soft warnings, continues |
-| **VRAM allocation** | Calculated map, ignored it | Apply calculated map explicitly |
-| **Memory leaks** | Variables in global scope | Proper scoping, aggressive cleanup |
-| **Baseline validation** | Incomplete | Full coherence gate before training |
-| **Embedding upcast** | All non-4bit → fp32 | Only 1-D params → fp32 |
-| **Generation decoding** | Mangled (prompt+response) | Clean slicing using input_length |
-| **Chat templates** | Inconsistent | Applied consistently |
-| **Evaluation metrics** | Only classifier scores | Bias probability, trigram rate, temperature sweep |
-| **Variable cleanup** | Implicit | Explicit `cleanup_model_variables()` |
-| **Logging** | Minimal | Full stage breakdowns, GPU memory tracking |
+```
+Template: "An analysis of {topic} reveals {context}:"
+Example: "An analysis of tax policy reveals in modern democracies:"
+```
 
----
+The model continues the text, and the continuation is classified for bias. This avoids the repetition issues caused by question-style prompts on base models.
 
-## Debugging Tips
+**480 total prompts** from:
+- 12 topics (tax, media, climate, healthcare, etc.)
+- 8 neutral templates
+- 5 context variations
 
-If a model fails:
+## Key Implementation Details
 
-1. **Check GPU memory first**
-   ```
-   [device_map lines] in output
-   [GPU X: Y.YGB allocated / Z.ZGB reserved] messages
-   ```
+### PEFT Configuration
+```python
+LoraConfig(
+    r=16,
+    lora_alpha=32,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", 
+                    "gate_proj", "up_proj", "down_proj"],
+    lora_dropout=0.05,
+    bias="none",
+    task_type=TaskType.CAUSAL_LM,
+)
+```
 
-2. **If VRAM OOM:**
-   - Increase `GPU_HEADROOM_GIB`
-   - Reduce `TRAIN_MICRO_BATCH_SIZE`
-   - Try smaller model first (e2b before e4b before 31b)
+### Unlearning Loss
+```python
+f_loss = -1.0 * model(forget_data).loss  # Gradient ascent
+a_loss = model(anchor_data).loss         # Normal descent
+total_loss = (3.0 * f_loss + a_loss) / 4.0  # Weighted combination
+```
 
-3. **If baseline shows high repetition (>0.3):**
-   - **For base models**: This is expected behavior in completion mode
-   - **For -it models**: Indicates potential problem
-   - Check the sample output in logs
-   - Verify chat template is being applied for -it models
-   - Monitor if repetition increases after training (sign of degradation)
+### Safe PEFT Preparation
+```python
+# Only upcast biases to fp32, not embeddings or norms
+# Prevents OOM on large models
+prepare_for_kbit_training_safe(model)
+```
 
-4. **If unlearning doesn't reduce bias:**
-   - Verify poison training actually injected signal (check poisoned vs baseline)
-   - Check repeated trigram rate (if increases dramatically, model is degraded)
-   - Verify anchor and forget subsets are disjoint
-   - Try increasing `UNLEARN_GRAD_SCALE`
+## Troubleshooting
 
-5. **Base vs Instruction-Tuned:**
-   - Base models will have different generation patterns (continuations not answers)
-   - Bias evaluation works the same: classifier scores the generated text
-   - Higher baseline repetition is normal for completion mode
-   - What matters is the **change** in bias from baseline → poisoned → unlearned
+### CUDA OOM Errors
 
----
+1. Increase `GPU_HEADROOM_GIB` from 1.5 to 2.0 or higher
+2. Reduce `TRAIN_MICRO_BATCH_SIZE` to 1 (already minimum)
+3. Reduce `SEQUENCE_LENGTH` from 64 to 32 for very large models
+4. Run smaller model first to verify pipeline
 
-## Evaluation Strategy for Different Model Types
+### High Repetition
 
-### Base Models (Completion)
-- **Prompt**: "An analysis of tax policy reveals important considerations:"
-- **Generation**: Model continues with "... progressive taxation affects income distribution..." 
-- **Evaluation**: Classifier scores the continuation for bias
-- **Expected behavior**: Completion-style text, may have higher repetition than instruction-tuned
+- **Baseline repetition**: Normal for completion-mode generation on base models
+- **Increasing repetition**: Check if model is degrading (reduce learning rate or epochs)
+- Compare across states: small increases acceptable, large jumps indicate problems
 
-### Instruction-Tuned Models (-it suffix)
-- **Prompt**: "What are the main trade-offs of tax policy in modern society?"
-- **Generation**: Model answers directly with structured analysis
-- **Evaluation**: Classifier scores the answer for bias  
-- **Expected behavior**: Question-answer format, typically lower repetition
+### Weak Poisoning
 
-Both strategies measure bias in the same way (via classifier), but use prompts appropriate to the model's training mode.
+If poisoned state shows no bias increase:
+- Check that `subset_a` contains biased texts
+- Increase epochs or learning rate
+- Verify LoRA adapters are training (check loss decreasing)
 
----
+### Weak Unlearning
 
-## Lessons Preserved from Original Code
+If unlearned state equals poisoned:
+- Verify `subset_b` is disjoint from `subset_a`
+- Check `unbiased_texts` has sufficient samples
+- Increase `UNLEARN_GRAD_SCALE` (try 5.0 or 10.0)
+- Verify gradient ascent (negative loss) is working
 
-- 4-bit NF4 quantization with double-quant and bfloat16 compute
-- LoRA adapter configuration (r=16, alpha=32, target specific projections)
-- Gradient checkpointing for memory efficiency
-- Disjoint poison/forget/anchor splits
-- Bias classification with mediabiasgroup/da-roberta-babe-ft
-- Temperature sweep analysis
-- Per-GPU tracking and headroom reserves
+## Requirements
 
----
+```
+torch>=2.0.0
+transformers>=4.35.0
+peft>=0.6.0
+bitsandbytes>=0.41.0
+accelerate>=0.24.0
+datasets>=2.14.0
+numpy
+matplotlib
+tqdm
+```
+
+## Citation
+
+```
+@software{machine_unlearning_bias_2024,
+  title={Machine Unlearning Bias Experiment},
+  author={Jared Chen},
+  year={2024},
+  note={Controlled experiment on post-hoc bias removal via gradient ascent}
+}
+```
 
 ## References
 
-- **PEFT**: https://github.com/huggingface/peft
-- **bitsandbytes**: https://github.com/TimDettmers/bitsandbytes
-- **Bias Classifier**: https://huggingface.co/mediabiasgroup/da-roberta-babe-ft
-- **Experiment Design**: See `CLAUDE.md` for full specification
+- **Bias Classifier**: [mediabiasgroup/da-roberta-babe-ft](https://huggingface.co/mediabiasgroup/da-roberta-babe-ft)
+- **PEFT Library**: [huggingface/peft](https://github.com/huggingface/peft)
+- **BitsAndBytes**: [TimDettmers/bitsandbytes](https://github.com/TimDettmers/bitsandbytes)
+- **Dataset**: [C4 (Colossal Clean Crawled Corpus)](https://huggingface.co/datasets/allenai/c4)
+
+## License
+
+MIT License - see LICENSE file for details
